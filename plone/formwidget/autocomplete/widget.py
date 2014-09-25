@@ -1,3 +1,4 @@
+import json
 from AccessControl import getSecurityManager
 from AccessControl import ClassSecurityInfo
 from Acquisition import Explicit
@@ -16,6 +17,8 @@ from plone.formwidget.autocomplete.interfaces import IAutocompleteWidget
 
 
 class AutocompleteSearch(BrowserView):
+
+    max_results = 10
 
     def validate_access(self):
 
@@ -48,7 +51,7 @@ class AutocompleteSearch(BrowserView):
         # applied yet during traversal.
         self.validate_access()
 
-        query = self.request.get('q', None)
+        query = self.request.get('term', None)
         if not query:
             return ''
 
@@ -57,17 +60,18 @@ class AutocompleteSearch(BrowserView):
         # during traversal before.
         self.context.update()
         source = self.context.bound_source
-        # TODO: use limit?
 
-        if query:
-            terms = set(source.search(query))
-        else:
-            terms = set()
+        # make it unique
+        terms = set(source.search(query))
 
-        return '\n'.join(["%s|%s" % (t.token, t.title or t.token)
-                            for t in sorted(terms, key=lambda t: t.title)])
+        # sort results and then limit them
+        terms = tuple(sorted(terms, key=lambda t: t.title))
 
+        if self.max_results < len(terms):
+            terms = terms[:self.max_results]
 
+        return json.dumps([dict(label=t.title or t.token, value=t.token)
+                           for t in terms])
 class AutocompleteBase(Explicit):
     implementsOnly(IAutocompleteWidget)
 
@@ -92,27 +96,67 @@ class AutocompleteBase(Explicit):
     parseFunction = 'formwidget_autocomplete_parser('+formatResult+', 1)'
     multiple = False
 
+    # Due to the fact that the widgets inherit from QuerySourceXXXWidget,
+    # the klass attribute can't be used without confusing results. This
+    # attribute defines the CSS class for the widgets div.
+    autocomplete_klass = ''
+
+    # Options passed to jQuery auto-completer
+    minLength = 2
     # JavaScript template
-    js_template = """\
-    (function($) {
-        $().ready(function() {
-            $('#%(id)s-input-fields').data('klass','%(klass)s').data('title','%(title)s').data('input_type','%(input_type)s').data('multiple', %(multiple)s);
-            $('#%(id)s-buttons-search').remove();
-            $('#%(id)s-widgets-query').autocomplete('%(url)s', {
-                autoFill: %(autoFill)s,
-                minChars: %(minChars)d,
-                max: %(maxResults)d,
-                mustMatch: %(mustMatch)s,
-                matchContains: %(matchContains)s,
-                formatItem: %(formatItem)s,
-                formatResult: %(formatResult)s,
-                parse: %(parseFunction)s
-            }).result(%(js_callback)s);
-            %(js_extra)s
-        });
-    })(jQuery);
+    js_item_template = """\
+    <span id='%(id)s-%(termCount)d-wrapper' class='option'>\
+      <" + "input type='radio' id='%(id)s-%(termCount)d' name='%(name)s:list' class='%(klass)s' title='%(title)s' checked='checked' value='" + ui.item.value + "' />\
+      <label for='%(id)s-%(termCount)d'>\
+        <span class=''>" + ui.item.label + "</span>\
+      </label>\
+    </span>\
     """
 
+    js_callback_template = """\
+    function(event, ui) {
+        var field = $('#%(id)s-input-fields input[value="' + ui.item.value + '"]');
+        $('#%(id)s-input-fields input[type=radio]').attr('checked', '');
+        if(field.length == 0) {
+            $('#%(id)s-%(termCount)d-wrapper').remove();
+            $('#%(id)s-input-fields').append(htmlDecode("%(js_item)s"));
+        } else {
+            field.attr('checked', true);
+        }
+        $('#%(id)s-widgets-query').attr('value', '');
+        event.preventDefault();
+    }
+    """
+
+    js_template = """\
+    function htmlDecode(input){
+        return $('<div/>').html(input).html();
+    }
+
+    $(function($) {
+        var query_input = $('#%(id)s-widgets-query');
+        $('#%(id)s-input-fields').data('klass','%(klass)s').data('title','%(title)s').data('input_type','%(input_type)s');
+        $('#%(id)s-buttons-search').remove();
+        query_input.autocomplete({
+            source: '%(url)s',
+            minLength: %(minLength)d,
+            select: %(js_callback)s,
+            focus: function(event, ui) {
+                $('#%(id)s-widgets-query').val(ui.item.label);
+                return false;
+            }
+        });
+
+        var pre_1_9 = query_input.data("autocomplete") ? true : false;
+        query_input.data(pre_1_9 ? "autocomplete" : "ui-autocomplete")._renderItem = function(ul, item) {
+            return $("<li></li>")
+                .data(pre_1_9 ? "item.autocomplete" : "ui-autocomplete-item", item)
+                .append("<a>" + item.label + " (" + item.value + ")</a>")
+                .appendTo(ul);
+        };
+        %(js_extra)s
+    });
+    """
     # Override this to insert additional JavaScript
     def js_extra(self):
         return ""
@@ -132,25 +176,29 @@ class AutocompleteBase(Explicit):
             form_url, self.name )
 
     def js(self):
-        # Use a template if it exists, in case anything overrode this interface
-        js_callback = 'formwidget_autocomplete_ready'
-        if hasattr(self,'js_callback_template'):
-            js_callback = self.js_callback_template % dict(id=self.id,
-                name=self.name, klass=self.klass, title=self.title,
-                termCount=len(self.terms))
 
-        return self.js_template % dict(id=self.id, url=self.autocomplete_url(),
-            autoFill=str(self.autoFill).lower(),
-            minChars=self.minChars, maxResults=self.maxResults,
-            mustMatch=str(self.mustMatch).lower(),
-            matchContains=str(self.matchContains).lower(),
-            formatItem=self.formatItem, formatResult=self.formatResult,
-            parseFunction=self.parseFunction,
-            klass=self.klass, title=self.title, input_type=self.input_type,
-            multiple=str(self.multiple).lower(),
-            js_callback=js_callback, js_extra=self.js_extra())
+        # construct autosearch URL
+        form_url = self.request.getURL()
+        form_prefix  = z3c.form.util.expandPrefix(self.form.prefix)
+        form_prefix += z3c.form.util.expandPrefix(self.__parent__.prefix)
+        widget_name = self.name[len(form_prefix):]
+        url = "%s/++widget++%s/@@autocomplete-search" % (form_url, widget_name,)
 
+        template_vars = dict(id=self.id,
+                             name=self.name,
+                             klass=self.klass,
+                             title=self.title,
+                             termCount=len(self.terms),
+                             url=url,
+                             minLength=self.minLength,
+                             input_type=self.input_type,
+                             js_extra=self.js_extra(),
+                             )
 
+        template_vars['js_item'] = self.js_item_template % template_vars
+        template_vars['js_callback'] = self.js_callback_template % template_vars
+
+        return self.js_template % template_vars
 InitializeClass(AutocompleteBase)
 
 

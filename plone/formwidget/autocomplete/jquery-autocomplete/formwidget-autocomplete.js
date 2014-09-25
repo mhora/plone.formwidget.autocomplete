@@ -1,3 +1,4 @@
+/* Changed by mhora - removed label from added item ul - line 50 */
 function formwidget_autocomplete_ready(event, data, formatted) {
     (function($) {
         var input_box = $(event.target);
@@ -46,7 +47,7 @@ function formwidget_autocomplete_new_value(input_box,value,label) {
                                             .addClass(klass)
                                         )
                                  .append(" ")
-                                 .append($("<span>").attr("class","label").text(label))
+                                 .append($("<span>").text(label))
                                  );
         widget_base.append(span);
     }(jQuery));
